@@ -1,4 +1,4 @@
-module github.com/your-username/go-audit-log
+module github.com/bagya-rmdn/go-audit-log
 
 go 1.23.0
 
