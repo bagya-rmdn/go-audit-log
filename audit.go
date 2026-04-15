@@ -146,7 +146,7 @@ func (a *Auditor) Middleware() gin.HandlerFunc {
 			Email:       stringFromCtx(c, a.cfg.EmailKey),
 			RoleID:      stringFromCtx(c, a.cfg.RoleIDKey),
 			Method:      c.Request.Method,
-			MenuPath:    c.GetHeader("X-Menu-Path"),
+			MenuPath:    c.GetHeader("Referer"),
 			APIPath:     c.Request.URL.Path,
 			ClientIP:    c.ClientIP(),
 			RequestBody: string(bodyBytes), // empty string for sensitive paths
