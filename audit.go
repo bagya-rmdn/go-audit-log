@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -37,6 +38,12 @@ type Config struct {
 	UserIDKey string
 	EmailKey  string
 	RoleIDKey string
+
+	// SensitivePaths is a list of path prefixes whose request body will NOT be
+	// logged (body is stored as empty string). Use this for routes that handle
+	// credentials or PII, e.g. login, change-password.
+	// Example: []string{"/auth/login", "/auth/change-password", "/auth/reset-password"}
+	SensitivePaths []string
 }
 
 // Auditor captures and persists audit log entries via Gin middleware.
@@ -101,16 +108,27 @@ func New(cfg Config) (*Auditor, error) {
 // Middleware returns a gin.HandlerFunc that captures the incoming request and
 // asynchronously persists an AuditLog entry after the downstream handlers finish.
 //
-// Must be registered AFTER AuthMiddleware so that userID/email/roleID are
-// already present in the Gin context.
+// Safe to use on both public and JWT-protected routes. On public routes
+// (no JWT), UserID/Email/RoleID will be stored as empty string.
+// Routes listed in Config.SensitivePaths will have their body omitted.
 //
+//	// On protected routes — user context is captured from JWT claims
 //	auth := r.Group("", middleware.AuthMiddleware())
 //	auth.Use(auditor.Middleware())
+//
+//	// On public routes — user context will be empty, body still captured
+//	// unless the path is in SensitivePaths
+//	public := r.Group("/auth")
+//	public.Use(auditor.Middleware())
 func (a *Auditor) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Determine whether this path is sensitive (body must not be logged).
+		sensitive := a.isSensitivePath(c.Request.URL.Path)
+
 		// Read and restore the request body so downstream handlers can still read it.
+		// Skip body capture entirely for sensitive paths.
 		var bodyBytes []byte
-		if c.Request.Body != nil {
+		if !sensitive && c.Request.Body != nil {
 			reader := io.Reader(c.Request.Body)
 			if a.cfg.BodySizeLimit > 0 {
 				reader = io.LimitReader(c.Request.Body, a.cfg.BodySizeLimit)
@@ -119,7 +137,7 @@ func (a *Auditor) Middleware() gin.HandlerFunc {
 			c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		}
 
-		// Let all downstream handlers (including the JWT middleware and route handler) run.
+		// Let all downstream handlers run.
 		c.Next()
 
 		entry := &AuditLog{
@@ -131,7 +149,7 @@ func (a *Auditor) Middleware() gin.HandlerFunc {
 			MenuPath:    c.GetHeader("X-Menu-Path"),
 			APIPath:     c.Request.URL.Path,
 			ClientIP:    c.ClientIP(),
-			RequestBody: string(bodyBytes),
+			RequestBody: string(bodyBytes), // empty string for sensitive paths
 			ServiceName: a.cfg.ServiceName,
 		}
 
@@ -140,6 +158,16 @@ func (a *Auditor) Middleware() gin.HandlerFunc {
 			_ = a.storage.Save(entry)
 		}()
 	}
+}
+
+// isSensitivePath reports whether path matches any prefix in SensitivePaths.
+func (a *Auditor) isSensitivePath(path string) bool {
+	for _, prefix := range a.cfg.SensitivePaths {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // stringFromCtx extracts a string value from the Gin context by key.
