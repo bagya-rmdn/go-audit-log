@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bagya-rmdn/go-audit-log/internal/domain"
+	"github.com/bagya-rmdn/go-audit-log/internal/repository"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -48,20 +50,19 @@ type Config struct {
 
 // Auditor captures and persists audit log entries via Gin middleware.
 type Auditor struct {
-	storage Storage
+	storage repository.Storage
 	cfg     Config
 }
 
 // Migrate creates or updates the audit_logs table schema.
 // Call once at service startup before New().
 func Migrate(db *gorm.DB) error {
-	return db.AutoMigrate(&AuditLog{})
+	return db.AutoMigrate(&domain.AuditLog{})
 }
 
 // New validates cfg, wires up the configured storage backends, and returns
 // a ready-to-use Auditor. Returns an error if neither DB nor LogFilePath is set.
 func New(cfg Config) (*Auditor, error) {
-	// apply defaults
 	if cfg.UserIDKey == "" {
 		cfg.UserIDKey = "userID"
 	}
@@ -81,14 +82,20 @@ func New(cfg Config) (*Auditor, error) {
 		cfg.MaxAgeDays = 30
 	}
 
-	var backends []Storage
+	var backends []repository.Storage
 
 	if cfg.DB != nil {
-		backends = append(backends, newPostgresStorage(cfg.DB))
+		backends = append(backends, repository.NewPostgresRepository(cfg.DB))
 	}
 
 	if cfg.LogFilePath != "" {
-		fs, err := newFileStorage(cfg)
+		fs, err := repository.NewFileRepository(repository.FileConfig{
+			LogFilePath:     cfg.LogFilePath,
+			MaxSizeMB:       cfg.MaxSizeMB,
+			MaxBackups:      cfg.MaxBackups,
+			MaxAgeDays:      cfg.MaxAgeDays,
+			CompressRotated: cfg.CompressRotated,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("auditlog: file storage: %w", err)
 		}
@@ -100,7 +107,7 @@ func New(cfg Config) (*Auditor, error) {
 	}
 
 	return &Auditor{
-		storage: newMultiStorage(backends...),
+		storage: repository.NewMultiRepository(backends...),
 		cfg:     cfg,
 	}, nil
 }
@@ -122,11 +129,8 @@ func New(cfg Config) (*Auditor, error) {
 //	public.Use(auditor.Middleware())
 func (a *Auditor) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Determine whether this path is sensitive (body must not be logged).
 		sensitive := a.isSensitivePath(c.Request.URL.Path)
 
-		// Read and restore the request body so downstream handlers can still read it.
-		// Skip body capture entirely for sensitive paths.
 		var bodyBytes []byte
 		if !sensitive && c.Request.Body != nil {
 			reader := io.Reader(c.Request.Body)
@@ -137,10 +141,9 @@ func (a *Auditor) Middleware() gin.HandlerFunc {
 			c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		}
 
-		// Let all downstream handlers run.
 		c.Next()
 
-		entry := &AuditLog{
+		entry := &domain.AuditLog{
 			CreatedAt:   time.Now().UTC(),
 			UserID:      stringFromCtx(c, a.cfg.UserIDKey),
 			Email:       stringFromCtx(c, a.cfg.EmailKey),
@@ -149,18 +152,16 @@ func (a *Auditor) Middleware() gin.HandlerFunc {
 			MenuPath:    c.GetHeader("Referer"),
 			APIPath:     c.Request.URL.Path,
 			ClientIP:    c.ClientIP(),
-			RequestBody: string(bodyBytes), // empty string for sensitive paths
+			RequestBody: string(bodyBytes),
 			ServiceName: a.cfg.ServiceName,
 		}
 
-		// Fire-and-forget: do not add latency to the HTTP response.
 		go func() {
 			_ = a.storage.Save(entry)
 		}()
 	}
 }
 
-// isSensitivePath reports whether path matches any prefix in SensitivePaths.
 func (a *Auditor) isSensitivePath(path string) bool {
 	for _, prefix := range a.cfg.SensitivePaths {
 		if strings.HasPrefix(path, prefix) {
@@ -170,13 +171,15 @@ func (a *Auditor) isSensitivePath(path string) bool {
 	return false
 }
 
-// stringFromCtx extracts a string value from the Gin context by key.
-// Returns "" if the key is absent or the value is not a string.
+// stringFromCtx extracts a value from the Gin context by key and converts it to string.
+// Uses fmt.Sprintf as fallback to handle non-string types (e.g. int32 RoleID from JWT claims).
 func stringFromCtx(c *gin.Context, key string) string {
 	val, exists := c.Get(key)
 	if !exists {
 		return ""
 	}
-	s, _ := val.(string)
-	return s
+	if s, ok := val.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", val)
 }

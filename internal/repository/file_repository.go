@@ -1,17 +1,27 @@
-package auditlog
+package repository
 
 import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/bagya-rmdn/go-audit-log/internal/domain"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-type fileStorage struct {
+type fileRepository struct {
 	logger *lumberjack.Logger
 }
 
-func newFileStorage(cfg Config) (Storage, error) {
+// FileConfig holds file rotation settings for the file storage backend.
+type FileConfig struct {
+	LogFilePath     string
+	MaxSizeMB       int
+	MaxBackups      int
+	MaxAgeDays      int
+	CompressRotated bool
+}
+
+func NewFileRepository(cfg FileConfig) (Storage, error) {
 	if cfg.LogFilePath == "" {
 		return nil, fmt.Errorf("auditlog: LogFilePath must not be empty")
 	}
@@ -29,7 +39,7 @@ func newFileStorage(cfg Config) (Storage, error) {
 		maxAge = 30
 	}
 
-	return &fileStorage{
+	return &fileRepository{
 		logger: &lumberjack.Logger{
 			Filename:   cfg.LogFilePath,
 			MaxSize:    maxSize,
@@ -40,14 +50,12 @@ func newFileStorage(cfg Config) (Storage, error) {
 	}, nil
 }
 
-// Save marshals entry as a compact JSON line and writes it to the log file.
-// lumberjack.Logger is goroutine-safe via its internal mutex.
-func (s *fileStorage) Save(entry *AuditLog) error {
+func (r *fileRepository) Save(entry *domain.AuditLog) error {
 	b, err := json.Marshal(entry)
 	if err != nil {
 		return fmt.Errorf("auditlog: marshal: %w", err)
 	}
 	b = append(b, '\n')
-	_, err = s.logger.Write(b)
+	_, err = r.logger.Write(b)
 	return err
 }
